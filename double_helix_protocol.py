@@ -53,7 +53,8 @@ class TransactionBlock:
 def seal(self) -> None:
     self.merkle_root = self.compute_merkle_root()
     self.hash = self.compute_hash()
-
+def set_paired_hash(self, partner_hash: str) -> None:
+    self.paired_hash = partner_hash
 
 @dataclass
 class ValidationBlock:
