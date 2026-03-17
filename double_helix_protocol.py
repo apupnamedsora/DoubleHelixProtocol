@@ -36,24 +36,23 @@ class TransactionBlock:
         tx_str = "".join(canonical_json(tx) for tx in self.transactions)
         return sha256_hex(tx_str.encode())
 
-    def payload(self) -> Dict[str, Any]:
-        return {
-            "index": self.index,
-            "timestamp": self.timestamp,
-            "transactions": self.transactions,
-            "prev_hash": self.prev_hash,
-            "paired_hash": self.paired_hash,
-            "nonce": self.nonce,
-            "meta": self.meta,
-            "merkle_root": self.merkle_root,
-        }
+   def payload(self) -> dict:
+    return {
+        "index": self.index,
+        "timestamp": self.timestamp,
+        "transactions": self.transactions,
+        "prev_hash": self.prev_hash,
+        "nonce": self.nonce,
+        "merkle_root": self.merkle_root,
+        "meta": self.meta,
+    }
 
     def compute_hash(self) -> str:
-        return sha256_hex(canonical_json(self.payload()).encode())
+    return sha256_hex(canonical_json(self.payload()).encode())
 
-    def seal(self) -> None:
-        self.merkle_root = self.compute_merkle_root()
-        self.hash = self.compute_hash()
+def seal(self) -> None:
+    self.merkle_root = self.compute_merkle_root()
+    self.hash = self.compute_hash()
 
 
 @dataclass
