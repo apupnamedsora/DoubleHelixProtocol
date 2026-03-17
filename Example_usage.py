@@ -1,35 +1,108 @@
-from double_helix_chain import DoubleHelixChain
+from double_helix_protocol import DoubleHelixProtocol
 
-chain = DoubleHelixChain(difficulty_a=2, difficulty_b=2)
 
-for i in range(5):
-    txs = [
-        {
-            "sender": f"user{i}",
-            "receiver": f"user{i+1}",
-            "amount": (i + 1) * 5,
-        }
-    ]
-    chain.mine_paired_blocks(
-        transactions=txs,
-        validation_proofs=[f"validation-proof-{i}"],
+def run_demo():
+    print("\n🧬 Initializing Double Helix Protocol...\n")
+
+    protocol = DoubleHelixProtocol(
+        difficulty_a=2,
+        difficulty_b=2,
+        use_threads=False  # safer for your environment
     )
 
-print("Before corruption:")
-chain.verify_integrity()
+    # -------------------------
+    # Mining Phase
+    # -------------------------
+    print("⛏️ Mining paired blocks...\n")
 
-chain.corrupt_tx_block(3, "paired_hash", "BAD" * 21 + "B")
+    for i in range(1, 6):
+        txs = [
+            {
+                "sender": f"user{i}",
+                "receiver": f"user{i+1}",
+                "amount": i * 7
+            }
+        ]
 
-print("\nDetected mismatches:")
-for item in chain.detect_mismatches():
-    print(item)
+        tx_block, val_block = protocol.mine_pair(
+            transactions=txs,
+            validation_proofs=[f"proof-{i}"]
+        )
 
-print("\nRepairing...")
-for result in chain.auto_repair():
-    print(result)
+        print(
+            f"Pair #{tx_block.index} | "
+            f"A: {tx_block.hash[:12]}... | "
+            f"B: {val_block.hash[:12]}..."
+        )
 
-print("\nAfter repair:")
-chain.verify_integrity()
+    # -------------------------
+    # Integrity Check
+    # -------------------------
+    print("\n🔍 Checking integrity...")
+    protocol.verify()
 
-print("\nQuarantine:")
-print(chain.quarantine)
+    # -------------------------
+    # Introduce Corruption
+    # -------------------------
+    print("\n⚠️ Introducing corruption...")
+
+    # Break pairing on one block
+    protocol.corrupt_val_block(2, "paired_hash", "X" * 64)
+
+    # Break transaction data on another
+    protocol.corrupt_tx_block(3, "transactions", [{"sender": "evil", "amount": 9999}])
+
+    # -------------------------
+    # Detect Mismatches
+    # -------------------------
+    print("\n🧠 Detecting mismatches...\n")
+
+    mismatches = protocol.detect_mismatches()
+
+    if not mismatches:
+        print("No mismatches detected (suspiciously perfect...)")
+    else:
+        for m in mismatches:
+            print(
+                f"Index {m['index']} | "
+                f"pair_ok={m['pair_ok']} | "
+                f"A_ok={m['a_ok']} | "
+                f"B_ok={m['b_ok']} | "
+                f"A_conf={m['a_confidence']} | "
+                f"B_conf={m['b_confidence']}"
+            )
+
+    # -------------------------
+    # Repair Phase
+    # -------------------------
+    print("\n🛠️ Attempting repair...\n")
+
+    results = protocol.auto_repair()
+
+    for r in results:
+        print(r)
+
+    # -------------------------
+    # Final Integrity Check
+    # -------------------------
+    print("\n🔎 Final integrity check...")
+    protocol.verify()
+
+    # -------------------------
+    # Quarantine Report
+    # -------------------------
+    print("\n☣️ Quarantine log:")
+
+    if not protocol.quarantine:
+        print("No blocks quarantined. System healed successfully.")
+    else:
+        for item in protocol.quarantine:
+            print(item)
+
+
+# -------------------------
+# Entry Point
+# -------------------------
+
+if __name__ == "__main__":
+    run_demo()
