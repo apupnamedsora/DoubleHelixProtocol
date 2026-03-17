@@ -85,23 +85,30 @@ class ValidationBlock:
         self.hash = self.compute_hash()
 
 
-class DoubleHelixChain:
+class DoubleHelixProtocol:
     """
-    DNA-inspired dual-strand chain with:
-    - parallel strand mining
-    - cross-strand pairing
-    - proof-of-work
+    DNA-inspired dual-strand protocol with:
+    - Strand A: transaction blocks
+    - Strand B: validation blocks
+    - optional threaded provisional mining
+    - final re-mining after cross-linking
     - mismatch detection
     - repair / quarantine logic
     """
 
-    def __init__(self, difficulty_a: int = 3, difficulty_b: int = 3):
+    def __init__(
+        self,
+        difficulty_a: int = 2,
+        difficulty_b: int = 2,
+        use_threads: bool = False,
+    ):
         self.strandA: List[TransactionBlock] = []
         self.strandB: List[ValidationBlock] = []
         self.difficulty_a = difficulty_a
         self.difficulty_b = difficulty_b
-        self._lock = threading.Lock()
+        self.use_threads = use_threads
         self.quarantine: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
         self._create_genesis_pair()
 
     # -------------------------
@@ -134,18 +141,19 @@ class DoubleHelixChain:
         genesis_tx.paired_hash = genesis_val.hash
         genesis_tx.seal()
 
+        # Genesis is structural, not mined to difficulty.
         self.strandA.append(genesis_tx)
         self.strandB.append(genesis_val)
 
     # -------------------------
-    # Mining
+    # Mining helpers
     # -------------------------
 
     def _mine_transaction_candidate(
         self,
         index: int,
         prev_hash: str,
-        paired_hash_placeholder: str,
+        paired_hash: str,
         transactions: List[Dict[str, Any]],
         meta: Dict[str, Any],
         timestamp: float,
@@ -156,7 +164,7 @@ class DoubleHelixChain:
             timestamp=timestamp,
             transactions=transactions,
             prev_hash=prev_hash,
-            paired_hash=paired_hash_placeholder,
+            paired_hash=paired_hash,
             meta=meta,
         )
         block.merkle_root = block.compute_merkle_root()
@@ -173,7 +181,7 @@ class DoubleHelixChain:
         self,
         index: int,
         prev_hash: str,
-        paired_hash_placeholder: str,
+        paired_hash: str,
         validation_proofs: List[str],
         meta: Dict[str, Any],
         timestamp: float,
@@ -183,7 +191,7 @@ class DoubleHelixChain:
             index=index,
             timestamp=timestamp,
             prev_hash=prev_hash,
-            paired_hash=paired_hash_placeholder,
+            paired_hash=paired_hash,
             validation_proofs=validation_proofs,
             meta=meta,
         )
@@ -196,8 +204,7 @@ class DoubleHelixChain:
                 return
             block.nonce += 1
 
-    def _remine_transaction_block(self, block: TransactionBlock) -> TransactionBlock:
-        block.nonce = 0
+    def _mine_tx_in_place(self, block: TransactionBlock) -> TransactionBlock:
         block.merkle_root = block.compute_merkle_root()
         while True:
             candidate_hash = block.compute_hash()
@@ -206,8 +213,7 @@ class DoubleHelixChain:
                 return block
             block.nonce += 1
 
-    def _remine_validation_block(self, block: ValidationBlock) -> ValidationBlock:
-        block.nonce = 0
+    def _mine_val_in_place(self, block: ValidationBlock) -> ValidationBlock:
         while True:
             candidate_hash = block.compute_hash()
             if meets_difficulty(candidate_hash, self.difficulty_b):
@@ -215,15 +221,28 @@ class DoubleHelixChain:
                 return block
             block.nonce += 1
 
-    def mine_paired_blocks(
+    def _remine_transaction_block(self, block: TransactionBlock) -> TransactionBlock:
+        block.nonce = 0
+        block.merkle_root = block.compute_merkle_root()
+        return self._mine_tx_in_place(block)
+
+    def _remine_validation_block(self, block: ValidationBlock) -> ValidationBlock:
+        block.nonce = 0
+        return self._mine_val_in_place(block)
+
+    # -------------------------
+    # Public mining API
+    # -------------------------
+
+    def mine_pair(
         self,
         transactions: List[Dict[str, Any]],
         validation_proofs: Optional[List[str]] = None,
         tx_meta: Optional[Dict[str, Any]] = None,
         val_meta: Optional[Dict[str, Any]] = None,
     ) -> Tuple[TransactionBlock, ValidationBlock]:
-        tx_meta = tx_meta or {"priority": "normal"}
-        val_meta = val_meta or {"priority": "normal"}
+        tx_meta = tx_meta or {"priority": "normal", "lane": "A"}
+        val_meta = val_meta or {"priority": "normal", "lane": "B"}
 
         with self._lock:
             prevA = self.strandA[-1]
@@ -231,47 +250,87 @@ class DoubleHelixChain:
             index = len(self.strandA)
 
         timestamp = time.time()
-        tx_result: Dict[str, TransactionBlock] = {}
-        val_result: Dict[str, ValidationBlock] = {}
 
         provisional_proofs = validation_proofs or []
         if not provisional_proofs:
             provisional_proofs = [sha256_hex(canonical_json(transactions).encode())]
 
-        tx_thread = threading.Thread(
-            target=self._mine_transaction_candidate,
-            args=(index, prevA.hash, "PENDING_B", transactions, tx_meta, timestamp, tx_result),
-        )
-        val_thread = threading.Thread(
-            target=self._mine_validation_candidate,
-            args=(index, prevB.hash, "PENDING_A", provisional_proofs, val_meta, timestamp, val_result),
-        )
+        if self.use_threads:
+            tx_result: Dict[str, TransactionBlock] = {}
+            val_result: Dict[str, ValidationBlock] = {}
 
-        tx_thread.start()
-        val_thread.start()
-        tx_thread.join()
-        val_thread.join()
+            tx_thread = threading.Thread(
+                target=self._mine_transaction_candidate,
+                args=(
+                    index,
+                    prevA.hash,
+                    "PENDING_B",
+                    transactions,
+                    tx_meta,
+                    timestamp,
+                    tx_result,
+                ),
+            )
+            val_thread = threading.Thread(
+                target=self._mine_validation_candidate,
+                args=(
+                    index,
+                    prevB.hash,
+                    "PENDING_A",
+                    provisional_proofs,
+                    val_meta,
+                    timestamp,
+                    val_result,
+                ),
+            )
 
-        tx_block = tx_result["tx"]
-        val_block = val_result["val"]
+            tx_thread.start()
+            val_thread.start()
+            tx_thread.join()
+            val_thread.join()
 
-        # First cross-link
-        val_block.paired_hash = tx_block.hash
-        val_block.seal()
+            tx_block = tx_result["tx"]
+            val_block = val_result["val"]
+        else:
+            tx_block = TransactionBlock(
+                index=index,
+                timestamp=timestamp,
+                transactions=transactions,
+                prev_hash=prevA.hash,
+                paired_hash="PENDING_B",
+                meta=tx_meta,
+            )
+            tx_block.merkle_root = tx_block.compute_merkle_root()
+            self._mine_tx_in_place(tx_block)
 
-        tx_block.paired_hash = val_block.hash
-        tx_block.seal()
+            val_block = ValidationBlock(
+                index=index,
+                timestamp=timestamp,
+                prev_hash=prevB.hash,
+                paired_hash="PENDING_A",
+                validation_proofs=provisional_proofs,
+                meta=val_meta,
+            )
+            self._mine_val_in_place(val_block)
 
-        # Re-mine so PoW includes actual final pair references
-        tx_block = self._remine_transaction_block(tx_block)
+        # Cross-link and re-mine so final PoW includes real partner references.
         val_block.paired_hash = tx_block.hash
         val_block = self._remine_validation_block(val_block)
+
+        tx_block.paired_hash = val_block.hash
+        tx_block = self._remine_transaction_block(tx_block)
+
+        # Final lock-in pass: ensure B points to final A, then A points to final B.
+        val_block.paired_hash = tx_block.hash
+        val_block = self._remine_validation_block(val_block)
+
         tx_block.paired_hash = val_block.hash
         tx_block = self._remine_transaction_block(tx_block)
 
         with self._lock:
             if tx_block.index != len(self.strandA) or val_block.index != len(self.strandB):
                 raise RuntimeError("Chain advanced during mining; retry block pair.")
+
             self.strandA.append(tx_block)
             self.strandB.append(val_block)
 
@@ -281,24 +340,39 @@ class DoubleHelixChain:
     # Validation helpers
     # -------------------------
 
-    def _is_valid_tx_block(self, block: TransactionBlock, prev_block: Optional[TransactionBlock]) -> bool:
+    def _is_valid_tx_block(
+        self,
+        block: TransactionBlock,
+        prev_block: Optional[TransactionBlock],
+    ) -> bool:
         if block.hash != block.compute_hash():
             return False
-        if not meets_difficulty(block.hash, self.difficulty_a):
+
+        if block.index != 0 and not meets_difficulty(block.hash, self.difficulty_a):
             return False
+
         if block.merkle_root != block.compute_merkle_root():
             return False
+
         if prev_block is None:
             return block.prev_hash == "0" * 64
+
         return block.prev_hash == prev_block.hash
 
-    def _is_valid_val_block(self, block: ValidationBlock, prev_block: Optional[ValidationBlock]) -> bool:
+    def _is_valid_val_block(
+        self,
+        block: ValidationBlock,
+        prev_block: Optional[ValidationBlock],
+    ) -> bool:
         if block.hash != block.compute_hash():
             return False
-        if not meets_difficulty(block.hash, self.difficulty_b):
+
+        if block.index != 0 and not meets_difficulty(block.hash, self.difficulty_b):
             return False
+
         if prev_block is None:
             return block.prev_hash == "0" * 64
+
         return block.prev_hash == prev_block.hash
 
     def _tx_confidence(self, index: int) -> int:
@@ -338,7 +412,7 @@ class DoubleHelixChain:
         return score
 
     # -------------------------
-    # Mismatch repair
+    # Mismatch detection / repair
     # -------------------------
 
     def detect_mismatches(self) -> List[Dict[str, Any]]:
@@ -381,7 +455,6 @@ class DoubleHelixChain:
         a_conf = self._tx_confidence(index)
         b_conf = self._val_confidence(index)
 
-        # Case 1: A valid, B invalid -> rebuild B from A
         if a_ok and not b_ok:
             b.prev_hash = prev_b.hash
             b.paired_hash = a.hash
@@ -390,7 +463,6 @@ class DoubleHelixChain:
             b = self._remine_validation_block(b)
             self.strandB[index] = b
 
-            # Re-seal A with fresh partner hash if needed
             a.paired_hash = b.hash
             a = self._remine_transaction_block(a)
             self.strandA[index] = a
@@ -398,7 +470,6 @@ class DoubleHelixChain:
             self._repair_forward_links_from(index + 1)
             return f"Repaired Strand B at index {index} using Strand A"
 
-        # Case 2: B valid, A invalid -> rebuild A pairing from B
         if b_ok and not a_ok:
             a.prev_hash = prev_a.hash
             a.paired_hash = b.hash
@@ -413,7 +484,6 @@ class DoubleHelixChain:
             self._repair_forward_links_from(index + 1)
             return f"Repaired Strand A at index {index} using Strand B"
 
-        # Case 3: both internally valid but pairing broken -> trust stronger side
         if a_ok and b_ok:
             if a_conf >= b_conf:
                 b.paired_hash = a.hash
@@ -423,6 +493,7 @@ class DoubleHelixChain:
                 a.paired_hash = b.hash
                 a = self._remine_transaction_block(a)
                 self.strandA[index] = a
+
                 self._repair_forward_links_from(index + 1)
                 return f"Resolved pair mismatch at index {index}; anchored on Strand A"
 
@@ -433,10 +504,10 @@ class DoubleHelixChain:
             b.paired_hash = a.hash
             b = self._remine_validation_block(b)
             self.strandB[index] = b
+
             self._repair_forward_links_from(index + 1)
             return f"Resolved pair mismatch at index {index}; anchored on Strand B"
 
-        # Case 4: both broken -> quarantine
         self.quarantine.append(
             {
                 "index": index,
@@ -449,11 +520,6 @@ class DoubleHelixChain:
         return f"Quarantined index {index}; both strands invalid"
 
     def _repair_forward_links_from(self, start_index: int) -> None:
-        """
-        Forward repair cascade:
-        if block i changes, block i+1 may need prev_hash and pair re-mining.
-        This is deliberately conservative.
-        """
         for i in range(start_index, min(len(self.strandA), len(self.strandB))):
             prev_a = self.strandA[i - 1]
             prev_b = self.strandB[i - 1]
@@ -469,7 +535,6 @@ class DoubleHelixChain:
             a.paired_hash = b.hash
             a = self._remine_transaction_block(a)
 
-            # Final lock-in
             b.paired_hash = a.hash
             b = self._remine_validation_block(b)
 
@@ -478,18 +543,15 @@ class DoubleHelixChain:
 
     def auto_repair(self) -> List[str]:
         results: List[str] = []
-        mismatches = self.detect_mismatches()
-
-        for mismatch in mismatches:
+        for mismatch in self.detect_mismatches():
             results.append(self.repair_mismatch_at(mismatch["index"]))
-
         return results
 
     # -------------------------
-    # Verification
+    # Full verification
     # -------------------------
 
-    def verify_integrity(self) -> bool:
+    def verify(self) -> bool:
         if len(self.strandA) != len(self.strandB):
             print("Integrity failure: strand lengths differ")
             return False
@@ -514,11 +576,11 @@ class DoubleHelixChain:
                 print(f"Integrity failure: Strand B block {i} pairing mismatch")
                 return False
 
-        print("Double Helix Chain is valid")
+        print("Double Helix Protocol is valid")
         return True
 
     # -------------------------
-    # Demo corruption helpers
+    # Corruption helpers
     # -------------------------
 
     def corrupt_tx_block(self, index: int, field_name: str, new_value: Any) -> None:
@@ -529,33 +591,52 @@ class DoubleHelixChain:
 
 
 if __name__ == "__main__":
-    chain = DoubleHelixChain(difficulty_a=2, difficulty_b=2)
+    protocol = DoubleHelixProtocol(
+        difficulty_a=2,
+        difficulty_b=2,
+        use_threads=False,
+    )
 
+    print("\nMining paired blocks...\n")
     for i in range(1, 5):
-        txs = [{"sender": f"user{i}", "receiver": f"user{i+1}", "amount": i * 10}]
-        chain.mine_paired_blocks(
+        txs = [
+            {
+                "sender": f"user{i}",
+                "receiver": f"user{i+1}",
+                "amount": i * 10,
+            }
+        ]
+
+        tx_block, val_block = protocol.mine_pair(
             transactions=txs,
             validation_proofs=[f"proof-{i}"],
             tx_meta={"priority": "normal", "lane": "A"},
             val_meta={"priority": "normal", "lane": "B"},
         )
 
+        print(
+            f"Mined pair #{tx_block.index} | "
+            f"A hash={tx_block.hash[:16]}... | "
+            f"B hash={val_block.hash[:16]}..."
+        )
+
     print("\nInitial integrity check:")
-    chain.verify_integrity()
+    protocol.verify()
 
     print("\nCorrupting Strand B block 2 paired_hash...")
-    chain.corrupt_val_block(2, "paired_hash", "X" * 64)
+    protocol.corrupt_val_block(2, "paired_hash", "X" * 64)
 
-    print("\nMismatches found:")
-    for mismatch in chain.detect_mismatches():
+    print("\nDetected mismatches:")
+    mismatches = protocol.detect_mismatches()
+    for mismatch in mismatches:
         print(mismatch)
 
     print("\nAuto-repair results:")
-    for result in chain.auto_repair():
+    for result in protocol.auto_repair():
         print(result)
 
     print("\nFinal integrity check:")
-    chain.verify_integrity()
+    protocol.verify()
 
     print("\nQuarantine log:")
-    print(chain.quarantine)
+    print(protocol.quarantine)
