@@ -1,129 +1,561 @@
 import hashlib
 import json
+import threading
 import time
-from typing import List, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def meets_difficulty(hash_hex: str, difficulty: int) -> bool:
+    return hash_hex.startswith("0" * difficulty)
+
+
+@dataclass
 class TransactionBlock:
-    def __init__(self, index, transactions, prev_hash, paired_hash, meta):
-        self.index = index
-        self.timestamp = time.time()
-        self.transactions = transactions
-        self.prev_hash = prev_hash
-        self.paired_hash = paired_hash
-        self.nonce = 0
-        self.meta = meta
+    index: int
+    timestamp: float
+    transactions: List[Dict[str, Any]]
+    prev_hash: str
+    paired_hash: str
+    nonce: int = 0
+    meta: Dict[str, Any] = field(default_factory=dict)
+    merkle_root: str = ""
+    hash: str = ""
+
+    def compute_merkle_root(self) -> str:
+        if not self.transactions:
+            return sha256_hex(b"")
+        tx_str = "".join(canonical_json(tx) for tx in self.transactions)
+        return sha256_hex(tx_str.encode())
+
+    def payload(self) -> Dict[str, Any]:
+        return {
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "transactions": self.transactions,
+            "prev_hash": self.prev_hash,
+            "paired_hash": self.paired_hash,
+            "nonce": self.nonce,
+            "meta": self.meta,
+            "merkle_root": self.merkle_root,
+        }
+
+    def compute_hash(self) -> str:
+        return sha256_hex(canonical_json(self.payload()).encode())
+
+    def seal(self) -> None:
         self.merkle_root = self.compute_merkle_root()
         self.hash = self.compute_hash()
 
-    def compute_merkle_root(self):
-        tx_str = "".join([json.dumps(tx, sort_keys=True) for tx in self.transactions])
-        return hashlib.sha256(tx_str.encode()).hexdigest()
 
-    def compute_hash(self):
-        block_string = json.dumps(
-            {
-                "index": self.index,
-                "timestamp": self.timestamp,
-                "transactions": self.transactions,
-                "prev_hash": self.prev_hash,
-                "paired_hash": self.paired_hash,
-                "merkle_root": self.merkle_root,
-                "nonce": self.nonce,
-                "meta": self.meta,
-            },
-            sort_keys=True,
-        ).encode()
-        return hashlib.sha256(block_string).hexdigest()
-
-
+@dataclass
 class ValidationBlock:
-    def __init__(self, index, prev_hash, paired_hash, validation_proofs, meta):
-        self.index = index
-        self.timestamp = time.time()
-        self.prev_hash = prev_hash
-        self.paired_hash = paired_hash
-        self.validation_proofs = validation_proofs
-        self.nonce = 0
-        self.meta = meta
-        self.hash = self.compute_hash()
+    index: int
+    timestamp: float
+    prev_hash: str
+    paired_hash: str
+    validation_proofs: List[str]
+    nonce: int = 0
+    meta: Dict[str, Any] = field(default_factory=dict)
+    hash: str = ""
 
-    def compute_hash(self):
-        block_string = json.dumps(
-            {
-                "index": self.index,
-                "timestamp": self.timestamp,
-                "prev_hash": self.prev_hash,
-                "paired_hash": self.paired_hash,
-                "validation_proofs": self.validation_proofs,
-                "nonce": self.nonce,
-                "meta": self.meta,
-            },
-            sort_keys=True,
-        ).encode()
-        return hashlib.sha256(block_string).hexdigest()
+    def payload(self) -> Dict[str, Any]:
+        return {
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "prev_hash": self.prev_hash,
+            "paired_hash": self.paired_hash,
+            "validation_proofs": self.validation_proofs,
+            "nonce": self.nonce,
+            "meta": self.meta,
+        }
+
+    def compute_hash(self) -> str:
+        return sha256_hex(canonical_json(self.payload()).encode())
+
+    def seal(self) -> None:
+        self.hash = self.compute_hash()
 
 
 class DoubleHelixChain:
-    def __init__(self):
-        self.strandA = []
-        self.strandB = []
+    """
+    DNA-inspired dual-strand chain with:
+    - parallel strand mining
+    - cross-strand pairing
+    - proof-of-work
+    - mismatch detection
+    - repair / quarantine logic
+    """
 
-        genesis_tx = TransactionBlock(0, [], "0" * 64, "0" * 64, {"priority": "normal"})
-        genesis_val = ValidationBlock(0, "0" * 64, genesis_tx.hash, [], {"priority": "normal"})
+    def __init__(self, difficulty_a: int = 3, difficulty_b: int = 3):
+        self.strandA: List[TransactionBlock] = []
+        self.strandB: List[ValidationBlock] = []
+        self.difficulty_a = difficulty_a
+        self.difficulty_b = difficulty_b
+        self._lock = threading.Lock()
+        self.quarantine: List[Dict[str, Any]] = []
+        self._create_genesis_pair()
+
+    # -------------------------
+    # Genesis
+    # -------------------------
+
+    def _create_genesis_pair(self) -> None:
+        ts = time.time()
+
+        genesis_tx = TransactionBlock(
+            index=0,
+            timestamp=ts,
+            transactions=[],
+            prev_hash="0" * 64,
+            paired_hash="GENESIS_B_PLACEHOLDER",
+            meta={"priority": "normal", "type": "genesis"},
+        )
+        genesis_tx.seal()
+
+        genesis_val = ValidationBlock(
+            index=0,
+            timestamp=ts,
+            prev_hash="0" * 64,
+            paired_hash=genesis_tx.hash,
+            validation_proofs=[genesis_tx.hash],
+            meta={"priority": "normal", "type": "genesis"},
+        )
+        genesis_val.seal()
 
         genesis_tx.paired_hash = genesis_val.hash
+        genesis_tx.seal()
 
         self.strandA.append(genesis_tx)
         self.strandB.append(genesis_val)
 
-    def add_transaction_block(self, transactions, meta={"priority": "normal"}):
-        prevA = self.strandA[-1]
-        prevB = self.strandB[-1]
+    # -------------------------
+    # Mining
+    # -------------------------
 
-        new_block = TransactionBlock(
-            prevA.index + 1,
-            transactions,
-            prevA.hash,
-            prevB.hash,
-            meta,
+    def _mine_transaction_candidate(
+        self,
+        index: int,
+        prev_hash: str,
+        paired_hash_placeholder: str,
+        transactions: List[Dict[str, Any]],
+        meta: Dict[str, Any],
+        timestamp: float,
+        result_box: Dict[str, TransactionBlock],
+    ) -> None:
+        block = TransactionBlock(
+            index=index,
+            timestamp=timestamp,
+            transactions=transactions,
+            prev_hash=prev_hash,
+            paired_hash=paired_hash_placeholder,
+            meta=meta,
+        )
+        block.merkle_root = block.compute_merkle_root()
+
+        while True:
+            candidate_hash = block.compute_hash()
+            if meets_difficulty(candidate_hash, self.difficulty_a):
+                block.hash = candidate_hash
+                result_box["tx"] = block
+                return
+            block.nonce += 1
+
+    def _mine_validation_candidate(
+        self,
+        index: int,
+        prev_hash: str,
+        paired_hash_placeholder: str,
+        validation_proofs: List[str],
+        meta: Dict[str, Any],
+        timestamp: float,
+        result_box: Dict[str, ValidationBlock],
+    ) -> None:
+        block = ValidationBlock(
+            index=index,
+            timestamp=timestamp,
+            prev_hash=prev_hash,
+            paired_hash=paired_hash_placeholder,
+            validation_proofs=validation_proofs,
+            meta=meta,
         )
 
-        self.strandA.append(new_block)
-        return new_block
+        while True:
+            candidate_hash = block.compute_hash()
+            if meets_difficulty(candidate_hash, self.difficulty_b):
+                block.hash = candidate_hash
+                result_box["val"] = block
+                return
+            block.nonce += 1
 
-    def add_validation_block(self, validation_proofs, meta={"priority": "normal"}):
-        prevA = self.strandA[-1]
-        prevB = self.strandB[-1]
+    def _remine_transaction_block(self, block: TransactionBlock) -> TransactionBlock:
+        block.nonce = 0
+        block.merkle_root = block.compute_merkle_root()
+        while True:
+            candidate_hash = block.compute_hash()
+            if meets_difficulty(candidate_hash, self.difficulty_a):
+                block.hash = candidate_hash
+                return block
+            block.nonce += 1
 
-        new_block = ValidationBlock(
-            prevB.index + 1,
-            prevB.hash,
-            prevA.hash,
-            validation_proofs,
-            meta,
+    def _remine_validation_block(self, block: ValidationBlock) -> ValidationBlock:
+        block.nonce = 0
+        while True:
+            candidate_hash = block.compute_hash()
+            if meets_difficulty(candidate_hash, self.difficulty_b):
+                block.hash = candidate_hash
+                return block
+            block.nonce += 1
+
+    def mine_paired_blocks(
+        self,
+        transactions: List[Dict[str, Any]],
+        validation_proofs: Optional[List[str]] = None,
+        tx_meta: Optional[Dict[str, Any]] = None,
+        val_meta: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[TransactionBlock, ValidationBlock]:
+        tx_meta = tx_meta or {"priority": "normal"}
+        val_meta = val_meta or {"priority": "normal"}
+
+        with self._lock:
+            prevA = self.strandA[-1]
+            prevB = self.strandB[-1]
+            index = len(self.strandA)
+
+        timestamp = time.time()
+        tx_result: Dict[str, TransactionBlock] = {}
+        val_result: Dict[str, ValidationBlock] = {}
+
+        provisional_proofs = validation_proofs or []
+        if not provisional_proofs:
+            provisional_proofs = [sha256_hex(canonical_json(transactions).encode())]
+
+        tx_thread = threading.Thread(
+            target=self._mine_transaction_candidate,
+            args=(index, prevA.hash, "PENDING_B", transactions, tx_meta, timestamp, tx_result),
+        )
+        val_thread = threading.Thread(
+            target=self._mine_validation_candidate,
+            args=(index, prevB.hash, "PENDING_A", provisional_proofs, val_meta, timestamp, val_result),
         )
 
-        self.strandB.append(new_block)
-        return new_block
+        tx_thread.start()
+        val_thread.start()
+        tx_thread.join()
+        val_thread.join()
 
-    def verify_integrity(self):
-        for a, b in zip(self.strandA, self.strandB):
-            if a.paired_hash != b.hash or b.paired_hash != a.hash:
-                print("Integrity failure")
+        tx_block = tx_result["tx"]
+        val_block = val_result["val"]
+
+        # First cross-link
+        val_block.paired_hash = tx_block.hash
+        val_block.seal()
+
+        tx_block.paired_hash = val_block.hash
+        tx_block.seal()
+
+        # Re-mine so PoW includes actual final pair references
+        tx_block = self._remine_transaction_block(tx_block)
+        val_block.paired_hash = tx_block.hash
+        val_block = self._remine_validation_block(val_block)
+        tx_block.paired_hash = val_block.hash
+        tx_block = self._remine_transaction_block(tx_block)
+
+        with self._lock:
+            if tx_block.index != len(self.strandA) or val_block.index != len(self.strandB):
+                raise RuntimeError("Chain advanced during mining; retry block pair.")
+            self.strandA.append(tx_block)
+            self.strandB.append(val_block)
+
+        return tx_block, val_block
+
+    # -------------------------
+    # Validation helpers
+    # -------------------------
+
+    def _is_valid_tx_block(self, block: TransactionBlock, prev_block: Optional[TransactionBlock]) -> bool:
+        if block.hash != block.compute_hash():
+            return False
+        if not meets_difficulty(block.hash, self.difficulty_a):
+            return False
+        if block.merkle_root != block.compute_merkle_root():
+            return False
+        if prev_block is None:
+            return block.prev_hash == "0" * 64
+        return block.prev_hash == prev_block.hash
+
+    def _is_valid_val_block(self, block: ValidationBlock, prev_block: Optional[ValidationBlock]) -> bool:
+        if block.hash != block.compute_hash():
+            return False
+        if not meets_difficulty(block.hash, self.difficulty_b):
+            return False
+        if prev_block is None:
+            return block.prev_hash == "0" * 64
+        return block.prev_hash == prev_block.hash
+
+    def _tx_confidence(self, index: int) -> int:
+        block = self.strandA[index]
+        prev_block = self.strandA[index - 1] if index > 0 else None
+        score = 0
+
+        if self._is_valid_tx_block(block, prev_block):
+            score += 4
+        if index < len(self.strandB) and self.strandB[index].paired_hash == block.hash:
+            score += 3
+        if index < len(self.strandB) and block.paired_hash == self.strandB[index].hash:
+            score += 3
+        if index + 1 < len(self.strandA) and self.strandA[index + 1].prev_hash == block.hash:
+            score += 2
+        if block.meta.get("type") == "genesis":
+            score += 2
+
+        return score
+
+    def _val_confidence(self, index: int) -> int:
+        block = self.strandB[index]
+        prev_block = self.strandB[index - 1] if index > 0 else None
+        score = 0
+
+        if self._is_valid_val_block(block, prev_block):
+            score += 4
+        if index < len(self.strandA) and self.strandA[index].paired_hash == block.hash:
+            score += 3
+        if index < len(self.strandA) and block.paired_hash == self.strandA[index].hash:
+            score += 3
+        if index + 1 < len(self.strandB) and self.strandB[index + 1].prev_hash == block.hash:
+            score += 2
+        if block.meta.get("type") == "genesis":
+            score += 2
+
+        return score
+
+    # -------------------------
+    # Mismatch repair
+    # -------------------------
+
+    def detect_mismatches(self) -> List[Dict[str, Any]]:
+        mismatches: List[Dict[str, Any]] = []
+
+        max_len = min(len(self.strandA), len(self.strandB))
+        for i in range(max_len):
+            a = self.strandA[i]
+            b = self.strandB[i]
+
+            pair_ok = (a.paired_hash == b.hash) and (b.paired_hash == a.hash)
+            a_ok = self._is_valid_tx_block(a, self.strandA[i - 1] if i > 0 else None)
+            b_ok = self._is_valid_val_block(b, self.strandB[i - 1] if i > 0 else None)
+
+            if not (pair_ok and a_ok and b_ok):
+                mismatches.append(
+                    {
+                        "index": i,
+                        "pair_ok": pair_ok,
+                        "a_ok": a_ok,
+                        "b_ok": b_ok,
+                        "a_confidence": self._tx_confidence(i),
+                        "b_confidence": self._val_confidence(i),
+                    }
+                )
+
+        return mismatches
+
+    def repair_mismatch_at(self, index: int) -> str:
+        if index <= 0 or index >= len(self.strandA) or index >= len(self.strandB):
+            return f"Cannot repair index {index}"
+
+        a = self.strandA[index]
+        b = self.strandB[index]
+        prev_a = self.strandA[index - 1]
+        prev_b = self.strandB[index - 1]
+
+        a_ok = self._is_valid_tx_block(a, prev_a)
+        b_ok = self._is_valid_val_block(b, prev_b)
+        a_conf = self._tx_confidence(index)
+        b_conf = self._val_confidence(index)
+
+        # Case 1: A valid, B invalid -> rebuild B from A
+        if a_ok and not b_ok:
+            b.prev_hash = prev_b.hash
+            b.paired_hash = a.hash
+            if not b.validation_proofs:
+                b.validation_proofs = [a.hash, a.merkle_root]
+            b = self._remine_validation_block(b)
+            self.strandB[index] = b
+
+            # Re-seal A with fresh partner hash if needed
+            a.paired_hash = b.hash
+            a = self._remine_transaction_block(a)
+            self.strandA[index] = a
+
+            self._repair_forward_links_from(index + 1)
+            return f"Repaired Strand B at index {index} using Strand A"
+
+        # Case 2: B valid, A invalid -> rebuild A pairing from B
+        if b_ok and not a_ok:
+            a.prev_hash = prev_a.hash
+            a.paired_hash = b.hash
+            a.merkle_root = a.compute_merkle_root()
+            a = self._remine_transaction_block(a)
+            self.strandA[index] = a
+
+            b.paired_hash = a.hash
+            b = self._remine_validation_block(b)
+            self.strandB[index] = b
+
+            self._repair_forward_links_from(index + 1)
+            return f"Repaired Strand A at index {index} using Strand B"
+
+        # Case 3: both internally valid but pairing broken -> trust stronger side
+        if a_ok and b_ok:
+            if a_conf >= b_conf:
+                b.paired_hash = a.hash
+                b = self._remine_validation_block(b)
+                self.strandB[index] = b
+
+                a.paired_hash = b.hash
+                a = self._remine_transaction_block(a)
+                self.strandA[index] = a
+                self._repair_forward_links_from(index + 1)
+                return f"Resolved pair mismatch at index {index}; anchored on Strand A"
+
+            a.paired_hash = b.hash
+            a = self._remine_transaction_block(a)
+            self.strandA[index] = a
+
+            b.paired_hash = a.hash
+            b = self._remine_validation_block(b)
+            self.strandB[index] = b
+            self._repair_forward_links_from(index + 1)
+            return f"Resolved pair mismatch at index {index}; anchored on Strand B"
+
+        # Case 4: both broken -> quarantine
+        self.quarantine.append(
+            {
+                "index": index,
+                "reason": "Both strands invalid",
+                "a_hash": a.hash,
+                "b_hash": b.hash,
+                "timestamp": time.time(),
+            }
+        )
+        return f"Quarantined index {index}; both strands invalid"
+
+    def _repair_forward_links_from(self, start_index: int) -> None:
+        """
+        Forward repair cascade:
+        if block i changes, block i+1 may need prev_hash and pair re-mining.
+        This is deliberately conservative.
+        """
+        for i in range(start_index, min(len(self.strandA), len(self.strandB))):
+            prev_a = self.strandA[i - 1]
+            prev_b = self.strandB[i - 1]
+            a = self.strandA[i]
+            b = self.strandB[i]
+
+            a.prev_hash = prev_a.hash
+            b.prev_hash = prev_b.hash
+
+            b.paired_hash = a.hash
+            b = self._remine_validation_block(b)
+
+            a.paired_hash = b.hash
+            a = self._remine_transaction_block(a)
+
+            # Final lock-in
+            b.paired_hash = a.hash
+            b = self._remine_validation_block(b)
+
+            self.strandA[i] = a
+            self.strandB[i] = b
+
+    def auto_repair(self) -> List[str]:
+        results: List[str] = []
+        mismatches = self.detect_mismatches()
+
+        for mismatch in mismatches:
+            results.append(self.repair_mismatch_at(mismatch["index"]))
+
+        return results
+
+    # -------------------------
+    # Verification
+    # -------------------------
+
+    def verify_integrity(self) -> bool:
+        if len(self.strandA) != len(self.strandB):
+            print("Integrity failure: strand lengths differ")
+            return False
+
+        for i, (a_block, b_block) in enumerate(zip(self.strandA, self.strandB)):
+            prev_a = self.strandA[i - 1] if i > 0 else None
+            prev_b = self.strandB[i - 1] if i > 0 else None
+
+            if not self._is_valid_tx_block(a_block, prev_a):
+                print(f"Integrity failure: Strand A block {i} invalid")
                 return False
 
-        print("Double Helix Chain valid")
+            if not self._is_valid_val_block(b_block, prev_b):
+                print(f"Integrity failure: Strand B block {i} invalid")
+                return False
+
+            if a_block.paired_hash != b_block.hash:
+                print(f"Integrity failure: Strand A block {i} pairing mismatch")
+                return False
+
+            if b_block.paired_hash != a_block.hash:
+                print(f"Integrity failure: Strand B block {i} pairing mismatch")
+                return False
+
+        print("Double Helix Chain is valid")
         return True
+
+    # -------------------------
+    # Demo corruption helpers
+    # -------------------------
+
+    def corrupt_tx_block(self, index: int, field_name: str, new_value: Any) -> None:
+        setattr(self.strandA[index], field_name, new_value)
+
+    def corrupt_val_block(self, index: int, field_name: str, new_value: Any) -> None:
+        setattr(self.strandB[index], field_name, new_value)
 
 
 if __name__ == "__main__":
-    chain = DoubleHelixChain()
+    chain = DoubleHelixChain(difficulty_a=2, difficulty_b=2)
 
-    tx = chain.add_transaction_block(
-        [{"sender": "Alice", "receiver": "Bob", "amount": 10}]
-    )
+    for i in range(1, 5):
+        txs = [{"sender": f"user{i}", "receiver": f"user{i+1}", "amount": i * 10}]
+        chain.mine_paired_blocks(
+            transactions=txs,
+            validation_proofs=[f"proof-{i}"],
+            tx_meta={"priority": "normal", "lane": "A"},
+            val_meta={"priority": "normal", "lane": "B"},
+        )
 
-    chain.add_validation_block([tx.hash])
-
+    print("\nInitial integrity check:")
     chain.verify_integrity()
+
+    print("\nCorrupting Strand B block 2 paired_hash...")
+    chain.corrupt_val_block(2, "paired_hash", "X" * 64)
+
+    print("\nMismatches found:")
+    for mismatch in chain.detect_mismatches():
+        print(mismatch)
+
+    print("\nAuto-repair results:")
+    for result in chain.auto_repair():
+        print(result)
+
+    print("\nFinal integrity check:")
+    chain.verify_integrity()
+
+    print("\nQuarantine log:")
+    print(chain.quarantine)
